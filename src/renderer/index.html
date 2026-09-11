@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://storage.googleapis.com blob: data:; connect-src 'self' https://cdn.jsdelivr.net https://storage.googleapis.com; media-src 'self' blob:" />
+    <title>Casual Hand Tracking</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>Casual Hand Tracking</h1>
+        <span id="status">초기화 중...</span>
+      </header>
+      <div id="stage">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <ul id="readout"></ul>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
