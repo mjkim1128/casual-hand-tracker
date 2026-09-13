@@ -1,5 +1,5 @@
 {
-  "name": "hand-tracking-vmc",
+  "name": "casual-hand-tracker",
   "version": "0.1.0",
   "description": "Webcam-only arm/hand tracking that outputs VMC Protocol for Warudo/VNyan/OBSKUR",
   "main": "out/main/index.js",
@@ -10,13 +10,17 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "start": "electron-vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc -b tsconfig.json"
   },
   "dependencies": {
-    "@mediapipe/tasks-vision": "^0.10.17"
+    "@huggingface/transformers": "^4.2.0",
+    "@mediapipe/tasks-vision": "^0.10.17",
+    "@pixiv/three-vrm": "^3.5.5",
+    "three": "^0.186.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "@types/three": "^0.185.4",
     "electron": "^31.0.0",
     "electron-vite": "^2.3.0",
     "typescript": "^5.5.0",

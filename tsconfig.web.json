@@ -10,5 +10,6 @@
     "noEmit": true,
     "useDefineForClassFields": true
   },
-  "include": ["src/renderer/**/*"]
+  "include": ["src/renderer/**/*"],
+  "exclude": ["src/renderer/depthWorker.ts"]
 }

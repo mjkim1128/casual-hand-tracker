@@ -22,6 +22,15 @@ export default defineConfig({
       rollupOptions: {
         input: resolve(__dirname, 'src/renderer/index.html')
       }
+    },
+    // onnxruntime-web (used by @huggingface/transformers) dynamically
+    // imports its own .mjs WASM loader at runtime — Vite's dependency
+    // pre-bundler doesn't carry that file along correctly, producing a
+    // "file does not exist in the optimize deps directory" error. Excluding
+    // it makes Vite serve it straight from node_modules instead, where the
+    // dynamic import resolves correctly.
+    optimizeDeps: {
+      exclude: ['onnxruntime-web', '@huggingface/transformers']
     }
   }
 })

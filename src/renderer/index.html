@@ -2,7 +2,17 @@
 <html lang="ko">
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://storage.googleapis.com blob: data:; connect-src 'self' https://cdn.jsdelivr.net https://storage.googleapis.com; media-src 'self' blob:" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self';
+        script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net;
+        style-src 'self' 'unsafe-inline';
+        connect-src 'self' https://cdn.jsdelivr.net https://storage.googleapis.com blob: data:;
+        img-src 'self' blob: data:;
+        media-src 'self' blob:;
+        worker-src 'self' blob:;"
+    />
+
     <title>Casual Hand Tracking</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
@@ -10,11 +20,35 @@
     <div id="app">
       <header>
         <h1>Casual Hand Tracking</h1>
+        <select id="camera-select"></select>
+        <button id="calibrate-button" disabled>신체 측정 시작</button>
         <span id="status">초기화 중...</span>
       </header>
+      <div id="calibration-prompt" hidden></div>
       <div id="stage">
-        <video id="webcam" autoplay playsinline muted></video>
-        <canvas id="overlay"></canvas>
+        <div class="pane" id="track-pane">
+          <video id="webcam" autoplay playsinline muted></video>
+          <canvas id="overlay"></canvas>
+          <span class="pane-label">카메라 + 스켈레톤</span>
+        </div>
+        <div class="pane" id="avatar-debug-pane">
+          <canvas id="avatar-debug-canvas"></canvas>
+          <span class="pane-label">아바타 + 스켈레톤</span>
+        </div>
+        <div class="pane" id="avatar-clean-pane">
+          <canvas id="avatar-clean-canvas"></canvas>
+          <span class="pane-label">아바타</span>
+        </div>
+      </div>
+      <div id="multiangle-stage">
+        <div class="pane" id="avatar-top-pane">
+          <canvas id="avatar-top-canvas"></canvas>
+          <span class="pane-label">스켈레톤 비교 — 위에서</span>
+        </div>
+        <div class="pane" id="avatar-side-pane">
+          <canvas id="avatar-side-canvas"></canvas>
+          <span class="pane-label">스켈레톤 비교 — 옆에서</span>
+        </div>
       </div>
       <ul id="readout"></ul>
     </div>
