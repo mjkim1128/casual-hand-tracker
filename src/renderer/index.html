@@ -21,10 +21,10 @@
       <header>
         <h1>Casual Hand Tracking</h1>
         <select id="camera-select"></select>
-        <button id="calibrate-button" disabled>신체 측정 시작</button>
+        <button id="measure-arm-button" disabled>팔 길이 측정</button>
+        <span id="measure-arm-status"></span>
         <span id="status">초기화 중...</span>
       </header>
-      <div id="calibration-prompt" hidden></div>
       <div id="stage">
         <div class="pane" id="track-pane">
           <video id="webcam" autoplay playsinline muted></video>

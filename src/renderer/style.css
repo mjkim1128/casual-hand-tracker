@@ -48,30 +48,24 @@ h1 {
   font-size: 12px;
 }
 
-#calibrate-button {
-  background: #2d6cdf;
-  color: #fff;
-  border: none;
+#measure-arm-button {
+  background: #1f2027;
+  color: #e8e8ec;
+  border: 1px solid #3a3b44;
   border-radius: 4px;
-  padding: 6px 12px;
+  padding: 4px 10px;
   font-size: 12px;
   cursor: pointer;
 }
 
-#calibrate-button:disabled {
-  background: #3a3b44;
-  color: #9aa0aa;
+#measure-arm-button:disabled {
+  opacity: 0.5;
   cursor: default;
 }
 
-#calibration-prompt {
-  background: #2d6cdf;
-  color: #fff;
-  border-radius: 8px;
-  padding: 10px 16px;
-  font-size: 15px;
-  font-weight: 600;
-  text-align: center;
+#measure-arm-status {
+  font-size: 12px;
+  color: #9aa0aa;
 }
 
 #stage {
