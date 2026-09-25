@@ -9,6 +9,15 @@
         "dev"
       ],
       "port": 3000
+    },
+    {
+      "name": "kalidokit-demo",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": [
+        "/c",
+        "cd /d C:\\Users\\mjkim\\AppData\\Local\\Temp\\claude\\C--Users-mjkim-casual-hand-tracker\\418a0056-aae2-48bd-8d57-fc34e6af6851\\scratchpad\\kalidokit && npx vite docs --port 5180 --strictPort"
+      ],
+      "port": 5180
     }
   ]
 }

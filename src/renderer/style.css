@@ -39,6 +39,20 @@ h1 {
   color: #9aa0aa;
 }
 
+#measure-button {
+  background: #2b5fd9;
+  color: #fff;
+  border: 0;
+  border-radius: 4px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#measure-button:hover {
+  background: #3a6fe8;
+}
+
 #camera-select {
   background: #1f2027;
   color: #e8e8ec;
@@ -46,26 +60,6 @@ h1 {
   border-radius: 4px;
   padding: 4px 8px;
   font-size: 12px;
-}
-
-#measure-arm-button {
-  background: #1f2027;
-  color: #e8e8ec;
-  border: 1px solid #3a3b44;
-  border-radius: 4px;
-  padding: 4px 10px;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-#measure-arm-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-#measure-arm-status {
-  font-size: 12px;
-  color: #9aa0aa;
 }
 
 #stage {
@@ -121,7 +115,10 @@ h1 {
 #avatar-debug-canvas,
 #avatar-clean-canvas,
 #avatar-top-canvas,
-#avatar-side-canvas {
+#avatar-side-canvas,
+#skeleton-front-canvas,
+#skeleton-top-canvas,
+#skeleton-side-canvas {
   position: absolute;
   inset: 0;
   width: 100%;

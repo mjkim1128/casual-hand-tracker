@@ -20,7 +20,9 @@ export default defineConfig({
     root: resolve(__dirname, 'src/renderer'),
     build: {
       rollupOptions: {
-        input: resolve(__dirname, 'src/renderer/index.html')
+        input: {
+          index: resolve(__dirname, 'src/renderer/index.html')
+        }
       }
     },
     // onnxruntime-web (used by @huggingface/transformers) dynamically

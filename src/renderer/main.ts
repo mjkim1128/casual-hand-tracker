@@ -1,17 +1,48 @@
 import {
   FilesetResolver,
   HolisticLandmarker,
+  HandLandmarker,
   DrawingUtils,
   type HolisticLandmarkerResult,
-  type Landmark
+  type HandLandmarkerResult,
+  type Landmark,
+  type NormalizedLandmark
 } from '@mediapipe/tasks-vision'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName, type VRM } from '@pixiv/three-vrm'
+import {
+  isFiniteVec3,
+  OneEuroFilter,
+  requestTPoseMeasurement,
+  resolveTrackingFrame,
+  setTrackingDebug,
+  setTrackingStatusHandler,
+  trackingDataFromResult,
+  withImageXY,
+  type ArmDiagnostics,
+  type ArmJoints,
+  type ResolvedFrame,
+  type TrackingData,
+  type Vec3Like
+} from './armTracking'
 
 const WASM_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/wasm'
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task'
+// Holistic's own hand branch derives its crop region from the POSE model's
+// wrist landmark, so it goes blind in lockstep whenever the pose wrist
+// estimate drifts (measured live: hand2D/hand3D dropped to nothing for 5+
+// seconds, exactly matching the frames where wristVis collapsed) - even
+// though the real hand was still plainly in frame. A standalone HandLandmarker
+// detects hands directly from the image, independent of the pose branch, so
+// it can keep tracking through exactly that failure mode. Its own output is
+// then reassigned to left/right by matching against the pose wrists (see
+// assignHandsToSides) rather than trusting its `handedness` classification,
+// since that assumes a mirrored/selfie image and MediaPipe's own crossing
+// convention there doesn't necessarily match Holistic's.
+const HAND_MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task'
 const VRM_URL = './models/VRM1_Constraint_Twist_Sample.vrm'
 
 // This app only tracks arms/hands (see the design doc) — hips and legs are
@@ -70,619 +101,41 @@ const avatarSideCanvas = document.getElementById('avatar-side-canvas') as HTMLCa
 const statusEl = document.getElementById('status') as HTMLElement
 const readoutEl = document.getElementById('readout') as HTMLUListElement
 const cameraSelect = document.getElementById('camera-select') as HTMLSelectElement
-const measureButton = document.getElementById('measure-arm-button') as HTMLButtonElement
-const measureStatusEl = document.getElementById('measure-arm-status') as HTMLElement
 const ctx = canvas.getContext('2d')!
 
 function setStatus(text: string): void {
   statusEl.textContent = text
 }
+setTrackingStatusHandler(setStatus)
+// [ik]/[tpose]/[glitch]/[ratchet] diagnostics go to the terminal running `npm run dev` (see mirrorConsole).
+setTrackingDebug(true)
+document.getElementById('measure-button')!.addEventListener('click', () => requestTPoseMeasurement())
 
-type Vec3Like = { x: number; y: number; z: number }
-
-// MediaPipe occasionally emits a landmark with a NaN/Infinity coordinate on
-// a degenerate frame. Used to reject those at the point they'd otherwise
-// enter held/accumulated state — see holdJoint and resolveTrackingFrame.
-function isFiniteVec3(v: Vec3Like): boolean {
-  return Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z)
-}
-
-// A plain object carrying just the landmark arrays applyPoseToVRM/the debug
-// skeleton need — decoupled from MediaPipe's own result type so both can be
-// driven by one frame's live `HolisticLandmarkerResult` via trackingDataFromResult.
-interface TrackingData {
-  poseLandmarks?: Vec3Like[] // normalized image-space (0-1) — for on-screen body position, see computeBodyOffset
-  poseWorldLandmarks?: Landmark[] // keeps `visibility` — needed for confidence gating, see resolveTrackingFrame
-  leftHandWorldLandmarks?: Vec3Like[]
-  rightHandWorldLandmarks?: Vec3Like[]
-  // Normalized image-space (0-1, perspective-projected) hand landmarks —
-  // unlike the world ones above, these shrink/grow with distance from the
-  // camera and share the Pose Landmarker's own image-space coordinate
-  // convention, which is exactly what handOcclusionBlend compares against.
-  leftHandLandmarks?: Vec3Like[]
-  rightHandLandmarks?: Vec3Like[]
-}
-
-function trackingDataFromResult(result: HolisticLandmarkerResult): TrackingData {
-  return {
-    poseLandmarks: result.poseLandmarks[0],
-    poseWorldLandmarks: result.poseWorldLandmarks[0],
-    leftHandWorldLandmarks: result.leftHandWorldLandmarks[0],
-    rightHandWorldLandmarks: result.rightHandWorldLandmarks[0],
-    leftHandLandmarks: result.leftHandLandmarks[0],
-    rightHandLandmarks: result.rightHandLandmarks[0]
-  }
-}
-
-// ---------- Tracking-frame resolution: confidence gating + bone-length-
-// constrained depth reconstruction ----------
-//
-// Two of the tracking problems (joints jumping to a wrong spot when an
-// arm/hand is barely visible, and forward-reach toward the camera not
-// registering at all) share a fix that has to happen in one place, before
-// mirroring/rigging, on the same raw shoulder/elbow/wrist points — this runs
-// once per frame and its result feeds both the actual rigging
-// (applyPoseToVRM/applyHandToVRM) and the debug skeleton, so the debug view
-// always shows exactly what's driving the avatar rather than a separate,
-// unfiltered copy.
-
-// MediaPipe's own visibility score for pose landmarks (hand landmarks don't
-// carry a meaningful one of their own). Below this, a given joint's reading
-// this frame is untrustworthy, and the last frame where it *was*
-// trustworthy keeps being used instead ("hold last good pose") rather than
-// letting a noisy low-confidence reading move it somewhere arbitrary.
-// Matches minPoseDetectionConfidence below — no reason for this gate to be
-// stricter than the detector's own confidence floor.
-const MIN_ARM_VISIBILITY = 0.5
-
-interface ArmJoints {
-  shoulder: Vec3Like
-  elbow: Vec3Like
-  wrist: Vec3Like
-}
-
-interface JointHold {
-  current: Vec3Like | null
-}
-
-// Persists the last resolved forward/backward sign for one arm segment's
-// depth reconstruction (see computeBlendedDepth) — `0` means "never resolved
-// yet". The held value is reused instead of re-deriving a sign fresh from
-// MediaPipe's own noisy raw Z every frame, which could flip on a single
-// noisy frame and — now that reconstruction runs unconditionally, so its
-// magnitude can be as large as the whole bone length — made the arm visibly
-// snap from reaching forward to folded backward and back.
-//
-// Resolving it once and then holding it *forever*, with no way to ever
-// revisit that first guess, turned out to have its own failure mode: at
-// rest, an arm's real depth barely changes, so raw Z there is mostly noise
-// — whichever way that noise happened to point on the very first live frame
-// gets locked in permanently, for the rest of the session, regardless of
-// how the arm actually moves afterward (seen in practice as one arm always
-// resolving in front of the body and the other always behind, with no
-// per-frame flicker at all — a static bias, not the jitter this was
-// originally built to prevent). `disagreeStreak` lets the hold still
-// self-correct: a *single* confident-but-wrong frame is still ignored (same
-// protection as before), but several confident, consistently-disagreeing
-// frames in a row are treated as real evidence the initial guess was wrong.
-interface SignHold {
-  current: number
-  disagreeStreak: number
-}
-
-// Holds and gates ONE joint independently of its neighbors. Shoulder, elbow
-// and wrist each drop below the confidence threshold at different times —
-// a raised wrist is very commonly less visible than the shoulder it's
-// attached to — and freezing the *whole* arm just because the wrist alone
-// went unreliable was making the shoulder reference point itself visibly
-// drift/skew away from the shoulder's own (still perfectly good) tracking.
-// `corroborated`: an independent signal (see resolveArm's `handTracked`)
-// that this joint is genuinely present even if its own visibility score is
-// low — without it, a wrist/elbow reaching toward the camera gets treated
-// exactly like a *badly* tracked one, since both look identical from
-// visibility alone (low score), even though a self-occluded-by-your-own-hand
-// wrist is precisely the case depth reconstruction exists to handle, not a
-// case to freeze and throw that data away.
-function holdJoint(
-  poseWorldLm: Landmark[] | undefined,
-  idx: number,
-  held: JointHold,
-  corroborated = false
-): { point: Vec3Like | null; live: boolean } {
-  const lm = poseWorldLm?.[idx]
-  // isFiniteVec3 rejects an occasional degenerate NaN/Infinity reading —
-  // without this, one bad frame permanently poisons the running max-length
-  // estimate below (Math.max with a NaN argument returns NaN forever after),
-  // which then corrupts that arm's bone rotation via slerp and breaks the
-  // avatar's rendering for the rest of the session.
-  const live = !!lm && (lm.visibility >= MIN_ARM_VISIBILITY || corroborated) && isFiniteVec3(lm)
-  if (live && lm) held.current = lm
-  return { point: held.current, live }
-}
-
-// A person's real bone lengths don't change during a tracking session, but
-// there's no longer a guided measurement step to determine them from this
-// person's actual body — resolveArm's bone-length depth reconstruction
-// (see computeBlendedDepth) uses the avatar's own bone lengths instead
-// (seeded once in main() and never changed after), which is only ever an
-// approximation of this specific person's real proportions.
-interface PersonArmLengths {
-  upper: number
-  lower: number
-}
-const personArmLengths: { left: PersonArmLengths; right: PersonArmLengths } = {
-  left: { upper: 0, lower: 0 },
-  right: { upper: 0, lower: 0 }
-}
-
-// Diagnostic-only numbers surfaced in the on-screen readout — see
-// computeBlendedDepth.
-interface ArmDiagnostics {
-  upperDepth: number
-  lowerDepth: number
-  // Raw (pre-correction) X/Y/Z displacement for each segment, straight from
-  // MediaPipe's world landmarks — added specifically to check, with actual
-  // numbers instead of eyeballing a screenshot, how much of a segment's
-  // movement is really vertical (Y) vs. depth (Z) rather than assuming.
-  rawUpperDelta: Vec3Like
-  rawLowerDelta: Vec3Like
-  // The actual (span-ratio vs. hand-occlusion, whichever's bigger) blend
-  // weight used for the lower-arm straightening correction this frame — see
-  // lowerBlendForStraightening and handOcclusionBlend.
-  lowerBlendForStraightening: number
-  // On-screen (X/Y only) segment length, pre-straightening — see
-  // startArmCalibration, which is the only other consumer of these.
-  upperXY: number
-  lowerXY: number
-}
-const ZERO_DELTA: Vec3Like = { x: 0, y: 0, z: 0 }
-const NO_ARM_DIAGNOSTICS: ArmDiagnostics = {
-  upperDepth: 0,
-  lowerDepth: 0,
-  rawUpperDelta: ZERO_DELTA,
-  rawLowerDelta: ZERO_DELTA,
-  lowerBlendForStraightening: 0,
-  upperXY: 0,
-  lowerXY: 0
-}
-
-// Below this fraction of the known real bone length, the on-screen (XY)
-// length is short enough that the segment is plausibly reaching toward or
-// away from the camera rather than just being tracking noise, so depth
-// reconstruction starts blending in. Blending smoothly instead of switching
-// on/off at a hard cutoff avoids a visible snap right at the boundary, and
-// keeps the correction's own sign ambiguity (see below) confined to the
-// region where the correction is smallest anyway.
-const RECON_BLEND_START_RATIO = 0.6
-
-// Below this on-screen distance between the elbow (Pose Landmarker) and the
-// hand's own wrist point (Hand Landmarker — a completely separate model),
-// relative to this frame's own upper-arm on-screen length (so it isn't
-// fooled by the person standing closer to or farther from the camera), the
-// two models are effectively reporting the elbow and the hand at the same
-// spot in the actual camera image. See handOcclusionBlend.
-const HAND_OCCLUSION_START_RATIO = 0.5
-
-// Direct, independent-of-computeBlendedDepth evidence that the hand is
-// visually hiding the elbow from the camera — two separate models (Pose
-// Landmarker's elbow, Hand Landmarker's wrist) agreeing they're in the same
-// place on-screen is much stronger than inferring it indirectly from how
-// foreshortened the shoulder-to-wrist span looks (see the comment above
-// upperBlendForStraightening/lowerBlendForStraightening), and unlike that
-// span-based ratio, it doesn't require the *upper* arm to also look
-// foreshortened before it can fire. `shoulderImg`/`elbowImg` must be the
-// Pose Landmarker's normalized image-space positions (not world) — this is
-// a purely on-screen check, in the same coordinate space handLandmarks is
-// already in.
-function handOcclusionBlend(shoulderImg: Vec3Like | undefined, elbowImg: Vec3Like | undefined, handLandmarks: Vec3Like[] | undefined): number {
-  if (!shoulderImg || !elbowImg || !handLandmarks) return 0
-  const upperArmImgLength = Math.hypot(elbowImg.x - shoulderImg.x, elbowImg.y - shoulderImg.y)
-  if (upperArmImgLength < 1e-4) return 0
-  const handWrist = handLandmarks[0]
-  const dist = Math.hypot(elbowImg.x - handWrist.x, elbowImg.y - handWrist.y)
-  const ratio = dist / upperArmImgLength
-  if (ratio >= HAND_OCCLUSION_START_RATIO) return 0
-  return 1 - ratio / HAND_OCCLUSION_START_RATIO
-}
-
-// See SignHold.
-const armSignHold: { left: { upper: SignHold; lower: SignHold }; right: { upper: SignHold; lower: SignHold } } = {
-  left: { upper: { current: 0, disagreeStreak: 0 }, lower: { current: 0, disagreeStreak: 0 } },
-  right: { upper: { current: 0, disagreeStreak: 0 }, lower: { current: 0, disagreeStreak: 0 } }
-}
-
-// Computes the Z offset (parent -> child) from the constraint that their
-// real distance apart is `realLength` (Pythagorean: dz = sqrt(realLength^2
-// - xyLength^2)) — for almost every pose, not just when the segment looks
-// foreshortened enough to plausibly be a forward/backward reach. Reliable
-// X/Y tracking plus a known real bone length is a better depth source in
-// almost every pose than MediaPipe's own weak Z axis ever was (a real test
-// standing at attention with the old ratio-gated version, which trusted raw
-// Z outright above a foreshortening threshold, showed a ~25-40deg fake
-// elbow bend even standing still).
-//
-// "Almost every" excludes one region on purpose — see
-// RECON_DEAD_ZONE_RATIO below — because this formula's own sensitivity to
-// xyLength blows up right where a standing-still arm actually lives.
-// d/d(xyLength)[sqrt(realLength^2 - xyLength^2)] = -xyLength /
-// sqrt(realLength^2 - xyLength^2), which diverges as xyLength ->
-// realLength. Concretely, at realLength=0.25m: a 1mm tracking-noise wobble
-// in xyLength at xyLength=0.20m only moves the computed depth by ~0.3mm,
-// but the *same* 1mm wobble at xyLength=0.249m (an arm held almost, but not
-// perfectly, straight — i.e. an ordinary standing pose, not a special
-// case) moves it by over 22mm. Left unguarded, that's a visibly trembling
-// avatar arm from nothing but MediaPipe's normal per-frame landmark jitter,
-// even when the person is holding perfectly still.
-//
-// Raw Z only ever gets a vote on which *sign* (toward vs. away from the
-// camera) the reconstructed magnitude should take, never on magnitude
-// itself. The *held* sign from a previous frame is reused (see SignHold)
-// rather than re-derived from raw Z's own noisy sign every frame —
-// re-deriving it fresh let a single noisy frame flip the sign, and since
-// the magnitude can be as large as the whole bone length, a flip showed up
-// as the arm visibly snapping from reaching forward to folded backward and
-// back. But raw Z near rest is mostly noise, small in magnitude — below
-// SIGN_CONFIDENCE_THRESHOLD, it's never trusted even to resolve the sign for
-// the first time, let alone override an already-held one. Above it,
-// SIGN_FLIP_HYSTERESIS_FRAMES consecutive disagreeing frames (not just one)
-// are required to actually flip an existing hold — see SignHold.
-const SIGN_CONFIDENCE_THRESHOLD = 0.03 // meters
-const SIGN_FLIP_HYSTERESIS_FRAMES = 8
-// Above this xyLength/realLength ratio, the segment is close enough to
-// fully straight that the sensitivity blow-up described above makes the
-// Pythagorean formula's own output less trustworthy than just calling the
-// depth zero — an everyday near-straight pose (standing still, an arm
-// raised to head height, etc.), not a deliberate reach, is exactly what
-// lives in this zone. Below it, the full reconstruction fades back in
-// smoothly (not a hard on/off switch, to avoid its own visible snap at the
-// boundary) as the segment looks more and more genuinely foreshortened.
-const RECON_DEAD_ZONE_RATIO = 0.9
-function computeBlendedDepth(parent: Vec3Like, child: Vec3Like, realLength: number, signHold: SignHold): number {
-  const rawDz = child.z - parent.z
-  if (realLength < 1e-4) return rawDz // no bone length known yet — trust MediaPipe's own Z as-is
-
-  const dx = child.x - parent.x
-  const dy = child.y - parent.y
-  const xyLength = Math.hypot(dx, dy)
-  const straightnessRatio = xyLength / realLength
-  const reconstructedDepth =
-    straightnessRatio >= RECON_DEAD_ZONE_RATIO
-      ? 0
-      : Math.sqrt(Math.max(realLength * realLength - xyLength * xyLength, 0)) * (1 - straightnessRatio / RECON_DEAD_ZONE_RATIO)
-
-  if (Math.abs(rawDz) >= SIGN_CONFIDENCE_THRESHOLD) {
-    const rawSign = Math.sign(rawDz)
-    if (signHold.current === 0) {
-      signHold.current = rawSign // first-ever confident resolution for this segment — nothing held yet
-    } else if (rawSign !== signHold.current) {
-      signHold.disagreeStreak += 1
-      if (signHold.disagreeStreak >= SIGN_FLIP_HYSTERESIS_FRAMES) {
-        signHold.current = rawSign
-        signHold.disagreeStreak = 0
-      }
-    } else {
-      signHold.disagreeStreak = 0
-    }
-  }
-  return signHold.current * reconstructedDepth
-}
-
-// Resolves one side's shoulder/elbow/wrist independently (see holdJoint),
-// then chains depth reconstruction outward from the shoulder (the wrist's
-// correction builds on the already-corrected elbow, not the raw one).
-// `confident` reports the *wrist's* own live status — the signal the hand
-// landmarks below piggyback their own confidence gating on, since they
-// don't have a usable one of their own.
-function resolveArm(
-  poseWorldLm: Landmark[] | undefined,
-  poseImageLm: Vec3Like[] | undefined, // normalized image-space — see handOcclusionBlend
-  shoulderIdx: number,
-  elbowIdx: number,
-  wristIdx: number,
-  estimate: PersonArmLengths,
-  handLandmarks: Vec3Like[] | undefined, // normalized image-space — see handOcclusionBlend
-  signHold: { upper: SignHold; lower: SignHold },
-  heldShoulder: JointHold,
-  heldElbow: JointHold,
-  heldWrist: JointHold
-): { arm: ArmJoints | null; confident: boolean; diagnostics: ArmDiagnostics } {
-  // A hand the Hand Landmarker is still confidently tracking is independent
-  // corroborating evidence that this arm's elbow/wrist region genuinely is
-  // there — even when the Pose Landmarker's own visibility score for them
-  // drops, which it will while pointing straight at the camera even though
-  // nothing is actually wrong (see holdJoint). Not applied to the shoulder,
-  // which a hand being tracked says nothing about.
-  const handTracked = !!handLandmarks
-  const shoulder = holdJoint(poseWorldLm, shoulderIdx, heldShoulder)
-  const elbow = holdJoint(poseWorldLm, elbowIdx, heldElbow, handTracked)
-  const wrist = holdJoint(poseWorldLm, wristIdx, heldWrist, handTracked)
-
-  if (!shoulder.point || !elbow.point || !wrist.point) {
-    return { arm: null, confident: false, diagnostics: NO_ARM_DIAGNOSTICS }
-  }
-
-  const upperDepth = computeBlendedDepth(shoulder.point, elbow.point, estimate.upper, signHold.upper)
-  const correctedElbow: Vec3Like = { x: elbow.point.x, y: elbow.point.y, z: shoulder.point.z + upperDepth }
-  const lowerDepth = computeBlendedDepth(correctedElbow, wrist.point, estimate.lower, signHold.lower)
-  const correctedWrist: Vec3Like = { x: wrist.point.x, y: wrist.point.y, z: correctedElbow.z + lowerDepth }
-
-  // When *both* segments individually look heavily foreshortened on-screen
-  // — not just the shoulder-to-wrist span, which shrinks in 2D just from a
-  // bent elbow even with zero camera-axis foreshortening at all, and so
-  // can't by itself tell "bent" apart from "reaching at the camera" — the
-  // whole arm is pointing close to the camera's own viewing axis. In that
-  // case the elbow is very likely hidden behind the hand/forearm from the
-  // camera's viewpoint, so its raw X/Y (never corrected above, only its Z
-  // was) is an extrapolated guess rather than a real observation, and tends
-  // to slide away from where the elbow actually is (e.g. downward),
-  // producing a visibly bent-looking arm even after Z correction — even
-  // though the person is holding it straight. Requiring *both* segments to
-  // be individually foreshortened (rather than just the overall span) is
-  // what tells a straight arm pointed at the camera apart from a normally
-  // bent elbow raised in front of the body, where usually at most one
-  // segment is foreshortened, not both.
-  const upperXY = Math.hypot(elbow.point.x - shoulder.point.x, elbow.point.y - shoulder.point.y)
-  const lowerXY = Math.hypot(wrist.point.x - correctedElbow.x, wrist.point.y - correctedElbow.y)
-  const upperRatio = estimate.upper < 1e-4 ? 1 : upperXY / estimate.upper
-  const lowerRatio = estimate.lower < 1e-4 ? 1 : lowerXY / estimate.lower
-  const wholeArmLength = estimate.upper + estimate.lower
-
-  const spanBasedUpperBlend = upperRatio >= RECON_BLEND_START_RATIO ? 0 : 1 - upperRatio / RECON_BLEND_START_RATIO
-  // Two independent signals for "the lower arm is foreshortened/hidden
-  // toward the camera": the span-based ratio above, and direct on-screen
-  // hand-vs-elbow proximity (see handOcclusionBlend) — whichever is more
-  // confident wins, since either alone is sufficient evidence.
-  const spanBasedLowerBlend = lowerRatio >= RECON_BLEND_START_RATIO ? 0 : 1 - lowerRatio / RECON_BLEND_START_RATIO
-  const handOcclusionBlendRaw = handOcclusionBlend(poseImageLm?.[shoulderIdx], poseImageLm?.[elbowIdx], handLandmarks)
-
-  // Both signals above go through the elbow's own on-screen position —
-  // upperRatio directly, handOcclusionBlend by comparing it against the
-  // hand. When the elbow is genuinely hidden, MediaPipe doesn't report a
-  // small-but-honest position there, it extrapolates one from scratch, and
-  // that guess can land anywhere (typically drooping down) — including
-  // somewhere that looks *not* foreshortened and isn't close to the hand
-  // either, fooling both checks into never firing at all even though the
-  // arm really is fully extended. Shoulder-to-wrist span never touches the
-  // elbow (the wrist is corroborated by the tracked hand, see holdJoint),
-  // so it can't be fooled the same way — but on its own it's genuinely
-  // ambiguous (see the comment above), so it only counts once there's also
-  // real, substantial camera-axis depth between wrist and shoulder (not
-  // just SIGN_CONFIDENCE_THRESHOLD-level noise), which a merely bent elbow
-  // (hand pulled toward the shoulder without actually reaching forward)
-  // never has.
-  const wholeArmXY = Math.hypot(wrist.point.x - shoulder.point.x, wrist.point.y - shoulder.point.y)
-  const wholeArmRatio = wholeArmLength < 1e-4 ? 1 : wholeArmXY / wholeArmLength
-  const wholeArmHasRealDepth = Math.abs(wrist.point.z - shoulder.point.z) >= SIGN_CONFIDENCE_THRESHOLD
-  const wholeArmBlendRaw =
-    wholeArmHasRealDepth && wholeArmRatio < RECON_BLEND_START_RATIO ? 1 - wholeArmRatio / RECON_BLEND_START_RATIO : 0
-
-  const upperBlendForStraightening = Math.max(spanBasedUpperBlend, wholeArmBlendRaw)
-  const lowerBlendForStraightening = Math.max(spanBasedLowerBlend, handOcclusionBlendRaw, wholeArmBlendRaw)
-
-  const straightBlend = Math.min(upperBlendForStraightening, lowerBlendForStraightening)
-  if (straightBlend > 0 && wholeArmLength > 1e-4) {
-    const f = estimate.upper / wholeArmLength
-    correctedElbow.x += (shoulder.point.x + f * (correctedWrist.x - shoulder.point.x) - correctedElbow.x) * straightBlend
-    correctedElbow.y += (shoulder.point.y + f * (correctedWrist.y - shoulder.point.y) - correctedElbow.y) * straightBlend
-    correctedElbow.z += (shoulder.point.z + f * (correctedWrist.z - shoulder.point.z) - correctedElbow.z) * straightBlend
-  }
-
-  const rawUpperDelta: Vec3Like = {
-    x: elbow.point.x - shoulder.point.x,
-    y: elbow.point.y - shoulder.point.y,
-    z: elbow.point.z - shoulder.point.z
-  }
-  const rawLowerDelta: Vec3Like = {
-    x: wrist.point.x - elbow.point.x,
-    y: wrist.point.y - elbow.point.y,
-    z: wrist.point.z - elbow.point.z
-  }
-
-  return {
-    arm: { shoulder: shoulder.point, elbow: correctedElbow, wrist: correctedWrist },
-    confident: wrist.live,
-    diagnostics: { upperDepth, lowerDepth, rawUpperDelta, rawLowerDelta, lowerBlendForStraightening, upperXY, lowerXY }
-  }
-}
-
-const heldLeftShoulder: JointHold = { current: null } // person-left (11)
-const heldLeftElbow: JointHold = { current: null } // person-left (13)
-const heldLeftWrist: JointHold = { current: null } // person-left (15)
-const heldRightShoulder: JointHold = { current: null } // person-right (12)
-const heldRightElbow: JointHold = { current: null } // person-right (14)
-const heldRightWrist: JointHold = { current: null } // person-right (16)
-const heldLeftHand: { current: Vec3Like[] | null } = { current: null }
-const heldRightHand: { current: Vec3Like[] | null } = { current: null }
-
-interface ResolvedFrame {
-  left: ArmJoints | null // person-left arm, depth-reconstructed
-  right: ArmJoints | null // person-right arm, depth-reconstructed
-  leftConfident: boolean // for the readout only — was THIS frame's left wrist trustworthy, or held?
-  rightConfident: boolean
-  leftHand: Vec3Like[] | null // person-left hand, held across low-confidence frames
-  rightHand: Vec3Like[] | null
-  leftDiagnostics: ArmDiagnostics
-  rightDiagnostics: ArmDiagnostics
-}
-
-function resolveTrackingFrame(data: TrackingData): ResolvedFrame {
-  const left = resolveArm(
-    data.poseWorldLandmarks,
-    data.poseLandmarks,
-    11,
-    13,
-    15,
-    personArmLengths.left,
-    data.leftHandLandmarks,
-    armSignHold.left,
-    heldLeftShoulder,
-    heldLeftElbow,
-    heldLeftWrist
-  )
-  const right = resolveArm(
-    data.poseWorldLandmarks,
-    data.poseLandmarks,
-    12,
-    14,
-    16,
-    personArmLengths.right,
-    data.rightHandLandmarks,
-    armSignHold.right,
-    heldRightShoulder,
-    heldRightElbow,
-    heldRightWrist
-  )
-
-  // Hands don't carry a usable visibility score of their own — gated
-  // instead on the same side's wrist confidence, just computed above (plus
-  // the same finite-value check as holdJoint, for the same reason).
-  if (data.leftHandWorldLandmarks && left.confident && data.leftHandWorldLandmarks.every(isFiniteVec3)) {
-    heldLeftHand.current = data.leftHandWorldLandmarks
-  }
-  if (data.rightHandWorldLandmarks && right.confident && data.rightHandWorldLandmarks.every(isFiniteVec3)) {
-    heldRightHand.current = data.rightHandWorldLandmarks
-  }
-
-  return {
-    left: left.arm,
-    right: right.arm,
-    leftConfident: left.confident,
-    rightConfident: right.confident,
-    leftHand: heldLeftHand.current,
-    rightHand: heldRightHand.current,
-    leftDiagnostics: left.diagnostics,
-    rightDiagnostics: right.diagnostics
-  }
-}
-
-// ---------- Guided arm-length self-calibration (see PersonArmLengths) ----------
-// personArmLengths is seeded from the avatar's own bone lengths, which are
-// only ever an approximation of this specific person's real proportions —
-// any mismatch injects a spurious depth offset via computeBlendedDepth's
-// sqrt(realLength^2 - xyLength^2) in *every* pose, not just reaches. This
-// briefly guides the person through a continuous motion (rather than one
-// static pose) to measure their real upper/lower arm length instead.
-//
-// The motion is chosen so the on-screen (X/Y) segment length gets close to
-// the segment's true length for a good stretch of it: raising the arms
-// from the side up overhead, and spreading them from a T-pose out to
-// pointing forward, both sweep through angles that stay mostly in the
-// camera's own image plane before ending pointed at the camera. The final
-// "pointed at the camera" instant of each sweep — where the hand can hide
-// the elbow and the on-screen reading is least trustworthy — is
-// deliberately never singled out or specially handled: a high percentile
-// of everything sampled during the sweep already sits close to the true
-// length (most of the sweep is near it), while that one foreshortened tail
-// end naturally falls to the *low* end of the sample distribution and gets
-// left out of a high percentile on its own, with no separate case needed.
-interface CalibrationPhase {
-  instruction: string
-  durationMs: number
-  sample: boolean
-}
-const CALIBRATION_PHASES: CalibrationPhase[] = [
-  { instruction: '차렷 자세로 서주세요', durationMs: 2000, sample: true },
-  { instruction: '천천히 팔을 만세 자세까지 들어올리세요', durationMs: 4000, sample: true },
-  { instruction: '이제 팔을 T자세(옆으로 쭉)로 벌려주세요', durationMs: 2000, sample: true },
-  { instruction: '천천히 팔을 앞으로 나란히 자세까지 뻗어주세요', durationMs: 4000, sample: true },
-  { instruction: '측정 완료', durationMs: 0, sample: false }
-]
-
-interface ArmLengthSamples {
-  upper: number[]
-  lower: number[]
-}
-let calibrationSamples: { left: ArmLengthSamples; right: ArmLengthSamples } | null = null
-let calibrationPhaseIndex = -1
-let calibrationPhaseStartedAt = 0
-let calibrationActive = false
-
-function percentile(values: number[], p: number): number {
-  const sorted = [...values].sort((a, b) => a - b)
-  const idx = Math.min(sorted.length - 1, Math.max(0, Math.round((p / 100) * (sorted.length - 1))))
-  return sorted[idx]
-}
-
-// A single spike frame must not corrupt the estimate the way a plain
-// running max would (see holdJoint's isFiniteVec3 comment for the same
-// class of one-bad-frame problem). A high percentile of everything sampled
-// during the sweep converges on close to the same value a max would find —
-// most of the sweep already sits near the true length — but one outlier
-// frame is diluted by the rest of the distribution instead of permanently
-// overriding it.
-const CALIBRATION_PERCENTILE = 90
-const MIN_CALIBRATION_SAMPLES = 20
-
-function startArmCalibration(): void {
-  calibrationSamples = { left: { upper: [], lower: [] }, right: { upper: [], lower: [] } }
-  calibrationPhaseIndex = 0
-  calibrationPhaseStartedAt = performance.now()
-  calibrationActive = true
-  measureButton.disabled = true
-  measureStatusEl.textContent = CALIBRATION_PHASES[0].instruction
-}
-
-// Called once per frame from the main loop while a calibration is running.
-function updateArmCalibration(resolved: ResolvedFrame): void {
-  if (!calibrationActive || !calibrationSamples) return
-  const phase = CALIBRATION_PHASES[calibrationPhaseIndex]
-  if (phase.sample) {
-    if (resolved.leftConfident) {
-      calibrationSamples.left.upper.push(resolved.leftDiagnostics.upperXY)
-      calibrationSamples.left.lower.push(resolved.leftDiagnostics.lowerXY)
-    }
-    if (resolved.rightConfident) {
-      calibrationSamples.right.upper.push(resolved.rightDiagnostics.upperXY)
-      calibrationSamples.right.lower.push(resolved.rightDiagnostics.lowerXY)
-    }
-  }
-
-  if (performance.now() - calibrationPhaseStartedAt < phase.durationMs) return
-  calibrationPhaseIndex += 1
-  if (calibrationPhaseIndex >= CALIBRATION_PHASES.length) {
-    finishArmCalibration()
-    return
-  }
-  calibrationPhaseStartedAt = performance.now()
-  measureStatusEl.textContent = CALIBRATION_PHASES[calibrationPhaseIndex].instruction
-}
-
-function finishArmCalibration(): void {
-  const samples = calibrationSamples
-  calibrationActive = false
-  calibrationSamples = null
-  measureButton.disabled = false
-  if (!samples) return
-
-  const apply = (side: PersonArmLengths, s: ArmLengthSamples): void => {
-    if (s.upper.length >= MIN_CALIBRATION_SAMPLES) side.upper = percentile(s.upper, CALIBRATION_PERCENTILE)
-    if (s.lower.length >= MIN_CALIBRATION_SAMPLES) side.lower = percentile(s.lower, CALIBRATION_PERCENTILE)
-  }
-  apply(personArmLengths.left, samples.left)
-  apply(personArmLengths.right, samples.right)
-
-  measureStatusEl.textContent = '측정 완료'
-}
 
 // poseWorldLandmarks (used for arm/hand rigging) are re-centered on the hips
 // every single frame, so they can never reveal whole-body movement — only
 // joint-relative pose. The normalized image-space landmarks are the only
 // signal for "where in frame is this person right now", so on-screen body
 // movement is driven off of those instead: track how far the shoulder
-// midpoint has drifted (in normalized 0-1 units) from a baseline center
+// midpoint has drifted (in normalized 0-1 units) from a fixed reference
 // point, and turn that into a small world-space offset.
 const BODY_OFFSET_SCALE = { x: 1.4, y: 1.4 }
 const BODY_OFFSET_LERP = 0.2
-// How many good frames to average into the baseline before locking it —
-// using just wherever the person happened to be standing on a single first
-// detected frame produced a persistent pull toward whatever direction that
-// one frame was off-center from center-frame.
-const BODY_OFFSET_BASELINE_SAMPLES_NEEDED = 60
-
-let bodyOffsetBaseline: { x: number; y: number } | null = null
-let bodyOffsetBaselineSumX = 0
-let bodyOffsetBaselineSumY = 0
-let bodyOffsetBaselineSamples = 0
+// Normalized image-space point that maps to "no offset" (avatar rendered
+// at its own neutral position). This used to be averaged from wherever the
+// person happened to be standing during the first ~60 tracked frames after
+// startup, which meant "centered" silently became whatever position that
+// was — off-frame if the person wasn't already in place in time — and
+// needed a fresh manual recenter practically every run. A fixed point tied
+// to the camera frame itself (dead center) instead makes "stand in the
+// middle of your own webcam view" reliably produce a centered avatar,
+// every session, with no first-few-seconds dependency. Tune these two
+// constants (not the mechanism) if testing shows the avatar sits off-center
+// even when the person is centered in frame — that just means this
+// project's typical camera framing doesn't put the shoulder midpoint at
+// exactly (0.5, 0.5).
+const BODY_OFFSET_CENTER_X = 0.5
+const BODY_OFFSET_CENTER_Y = 0.5
 
 function computeBodyOffsetTarget(poseLandmarks: Vec3Like[] | undefined): THREE.Vector3 | null {
   if (!poseLandmarks) return null
@@ -691,16 +144,8 @@ function computeBodyOffsetTarget(poseLandmarks: Vec3Like[] | undefined): THREE.V
     y: (poseLandmarks[11].y + poseLandmarks[12].y) / 2
   }
 
-  if (bodyOffsetBaselineSamples < BODY_OFFSET_BASELINE_SAMPLES_NEEDED) {
-    bodyOffsetBaselineSumX += shoulderMid.x
-    bodyOffsetBaselineSumY += shoulderMid.y
-    bodyOffsetBaselineSamples++
-    bodyOffsetBaseline = { x: bodyOffsetBaselineSumX / bodyOffsetBaselineSamples, y: bodyOffsetBaselineSumY / bodyOffsetBaselineSamples }
-  }
-
-  const baseline = bodyOffsetBaseline ?? shoulderMid // always set above on the very first call
-  const dx = shoulderMid.x - baseline.x
-  const dy = shoulderMid.y - baseline.y
+  const dx = shoulderMid.x - BODY_OFFSET_CENTER_X
+  const dy = shoulderMid.y - BODY_OFFSET_CENTER_Y
   // Mirror x (matches the mirrored webcam pane) and flip y (image-space y
   // increases downward, three.js world y increases upward).
   return new THREE.Vector3(-dx * BODY_OFFSET_SCALE.x, -dy * BODY_OFFSET_SCALE.y, 0)
@@ -752,8 +197,6 @@ cameraSelect.addEventListener('change', () => {
     .catch((err) => setStatus(`오류: ${(err as Error).message}`))
 })
 
-measureButton.addEventListener('click', startArmCalibration)
-
 async function setupHolistic(): Promise<HolisticLandmarker> {
   const filesetResolver = await FilesetResolver.forVisionTasks(WASM_BASE)
   return HolisticLandmarker.createFromOptions(filesetResolver, {
@@ -763,11 +206,81 @@ async function setupHolistic(): Promise<HolisticLandmarker> {
     },
     runningMode: 'VIDEO',
     minPoseDetectionConfidence: 0.5,
-    minHandLandmarksConfidence: 0.5
+    // Lowered from the 0.5 default: the hand model dropped the hand for the whole of every
+    // forward reach - see whether a laxer threshold keeps it.
+    minHandLandmarksConfidence: 0.2
   })
 }
 
-function drawResult(result: HolisticLandmarkerResult, drawer: DrawingUtils): void {
+// See HAND_MODEL_URL - independent of Holistic's pose-derived hand crop.
+// Measured live: this returned rawCandidates=0 on every single frame under
+// both GPU and CPU delegate, with no exception thrown from detectForVideo
+// either way - ruling out the GPU-context-conflict theory tried earlier.
+// Back on GPU (CPU only made it slower for no benefit). The one-time log
+// right after creation, plus the try/catch around detectForVideo below,
+// are there to catch whatever's actually failing instead of guessing again.
+async function setupHandLandmarker(): Promise<HandLandmarker> {
+  const filesetResolver = await FilesetResolver.forVisionTasks(WASM_BASE)
+  const landmarker = await HandLandmarker.createFromOptions(filesetResolver, {
+    baseOptions: {
+      modelAssetPath: HAND_MODEL_URL,
+      delegate: 'GPU'
+    },
+    runningMode: 'VIDEO',
+    numHands: 2,
+    minHandDetectionConfidence: 0.2,
+    minHandPresenceConfidence: 0.2,
+    minTrackingConfidence: 0.2
+  })
+  console.log('[hand] HandLandmarker created successfully')
+  return landmarker
+}
+
+interface AssignedHand {
+  landmarks: NormalizedLandmark[]
+  worldLandmarks: Landmark[]
+}
+interface AssignedHands {
+  left: AssignedHand | null
+  right: AssignedHand | null
+}
+
+// Matches each independently-detected hand to the person's left/right arm by
+// image-space proximity to the POSE model's own wrist landmarks (11/13/15 =
+// left, 12/14/16 = right), rather than trusting HandLandmarker's own
+// `handedness` classification - that assumes a mirrored/selfie input and
+// isn't guaranteed to line up with which side Holistic's pose skeleton calls
+// "left". Two independent detections both racing for the same side (hands
+// crossed/overlapping) resolve to whichever is closer; the loser is dropped
+// rather than double-assigned.
+function assignHandsToSides(handResult: HandLandmarkerResult, poseLandmarks: Vec3Like[] | undefined): AssignedHands {
+  const result: AssignedHands = { left: null, right: null }
+  if (!poseLandmarks || !poseLandmarks[15] || !poseLandmarks[16]) return result
+  const leftWrist = poseLandmarks[15]
+  const rightWrist = poseLandmarks[16]
+
+  const candidates = handResult.landmarks
+    .map((landmarks, i) => ({ landmarks, worldLandmarks: handResult.worldLandmarks[i], wrist: landmarks[0] }))
+    .filter((c) => c.wrist)
+
+  let bestLeft: { dist: number; hand: AssignedHand } | null = null
+  let bestRight: { dist: number; hand: AssignedHand } | null = null
+  for (const c of candidates) {
+    const dLeft = Math.hypot(c.wrist.x - leftWrist.x, c.wrist.y - leftWrist.y)
+    const dRight = Math.hypot(c.wrist.x - rightWrist.x, c.wrist.y - rightWrist.y)
+    const hand: AssignedHand = { landmarks: c.landmarks, worldLandmarks: c.worldLandmarks }
+    if (dLeft <= dRight) {
+      if (!bestLeft || dLeft < bestLeft.dist) bestLeft = { dist: dLeft, hand }
+    } else {
+      if (!bestRight || dRight < bestRight.dist) bestRight = { dist: dRight, hand }
+    }
+  }
+  result.left = bestLeft?.hand ?? null
+  result.right = bestRight?.hand ?? null
+  return result
+}
+
+function drawResult(result: HolisticLandmarkerResult, hands: AssignedHands, drawer: DrawingUtils): void {
   ctx.save()
   ctx.clearRect(0, 0, canvas.width, canvas.height)
 
@@ -781,25 +294,29 @@ function drawResult(result: HolisticLandmarkerResult, drawer: DrawingUtils): voi
     })
     drawer.drawLandmarks(upperBody, { color: '#00d0ff', radius: 3 })
   }
-  for (const landmarks of result.leftHandLandmarks) {
-    drawer.drawConnectors(landmarks, HolisticLandmarker.HAND_CONNECTIONS, {
+  // Drawn from the independent HandLandmarker's assignment (see
+  // assignHandsToSides), not result.leftHandLandmarks/rightHandLandmarks -
+  // this overlay should show exactly what's actually driving the rig.
+  if (hands.left) {
+    drawer.drawConnectors(hands.left.landmarks, HandLandmarker.HAND_CONNECTIONS, {
       color: '#ff5f7e',
       lineWidth: 2
     })
-    drawer.drawLandmarks(landmarks, { color: '#ff5f7e', radius: 2 })
+    drawer.drawLandmarks(hands.left.landmarks, { color: '#ff5f7e', radius: 2 })
   }
-  for (const landmarks of result.rightHandLandmarks) {
-    drawer.drawConnectors(landmarks, HolisticLandmarker.HAND_CONNECTIONS, {
+  if (hands.right) {
+    drawer.drawConnectors(hands.right.landmarks, HandLandmarker.HAND_CONNECTIONS, {
       color: '#ffd25f',
       lineWidth: 2
     })
-    drawer.drawLandmarks(landmarks, { color: '#ffd25f', radius: 2 })
+    drawer.drawLandmarks(hands.right.landmarks, { color: '#ffd25f', radius: 2 })
   }
   ctx.restore()
 }
 
 function updateReadout(
   result: HolisticLandmarkerResult,
+  hands: AssignedHands,
   fps: number,
   resolved: ResolvedFrame,
   calibration: AvatarCalibration
@@ -811,8 +328,8 @@ function updateReadout(
   const lines = [
     `fps: ${fps.toFixed(1)}`,
     `pose landmarks: ${result.poseLandmarks[0]?.length ?? 0}`,
-    `left hand landmarks: ${result.leftHandLandmarks[0]?.length ?? 0}`,
-    `right hand landmarks: ${result.rightHandLandmarks[0]?.length ?? 0}`,
+    `left hand landmarks: ${hands.left?.landmarks.length ?? 0}`,
+    `right hand landmarks: ${hands.right?.landmarks.length ?? 0}`,
     `팔 신뢰도 — L: ${resolved.leftConfident ? 'OK' : 'HOLD'} / R: ${resolved.rightConfident ? 'OK' : 'HOLD'}`,
     `아바타 뼈 길이(상완/전완/전체) L: ${fmt(avatar.left.upperArm, avatar.left.lowerArm)} R: ${fmt(avatar.right.upperArm, avatar.right.lowerArm)}`,
     `뻗기 깊이(상완/전완) L: ${resolved.leftDiagnostics.upperDepth.toFixed(3)}/${resolved.leftDiagnostics.lowerDepth.toFixed(3)} R: ${resolved.rightDiagnostics.upperDepth.toFixed(3)}/${resolved.rightDiagnostics.lowerDepth.toFixed(3)}`,
@@ -1534,57 +1051,12 @@ async function loadAvatar(scene: THREE.Scene): Promise<VRM> {
 
 // ---------- Adaptive smoothing (One Euro filter) ----------
 //
-// Applied to the final tracked direction/basis vectors (after depth
-// reconstruction above, right before aimBoneToward/aimBasisToward) — not to
-// the raw landmarks, since smoothing those first would feed the depth
-// reconstruction stale, lagged data. A One Euro filter is used instead of a
-// fixed-strength lerp because it adapts its own strength to how fast the
-// tracked value is moving: nearly still, it damps hard (kills jitter);
-// moving fast, it damps almost not at all (stays responsive) — a constant
-// lerp factor can't do both without either leaving jitter in or adding lag
-// to fast motion.
-class OneEuroFilter {
-  private hasPrev = false
-  private xPrev = 0
-  private dxPrev = 0
-
-  constructor(
-    private readonly minCutoff: number,
-    private readonly beta: number,
-    private readonly dCutoff = 1.0
-  ) {}
-
-  private alpha(cutoff: number, dt: number): number {
-    const tau = 1 / (2 * Math.PI * cutoff)
-    return 1 / (1 + tau / dt)
-  }
-
-  filter(x: number, dt: number): number {
-    if (!this.hasPrev || dt <= 0) {
-      this.hasPrev = true
-      this.xPrev = x
-      this.dxPrev = 0
-      return x
-    }
-    const dx = (x - this.xPrev) / dt
-    const dAlpha = this.alpha(this.dCutoff, dt)
-    const dxHat = this.dxPrev + dAlpha * (dx - this.dxPrev)
-    const cutoff = this.minCutoff + this.beta * Math.abs(dxHat)
-    const a = this.alpha(cutoff, dt)
-    const xHat = this.xPrev + a * (x - this.xPrev)
-    this.xPrev = xHat
-    this.dxPrev = dxHat
-    return xHat
-  }
-
-  // Forces the next filter() call to treat its input as a fresh first
-  // sample instead of comparing it against a stale xPrev — see
-  // Vector3OneEuroFilter.reset() for why this matters after a tracking gap.
-  reset(): void {
-    this.hasPrev = false
-  }
-}
-
+// OneEuroFilter itself is exported from armTracking.ts (used there for the
+// hand-landmark and shoulder-depth smoothing). This section covers everything
+// else it's used for: the final tracked direction/basis vectors, filtered
+// right before aimBoneToward/aimBasisToward (not the raw landmarks — smoothing
+// those first would feed the IK solve stale, lagged data).
+//
 // Filters a THREE.Vector3 as 3 independent scalar channels — the direction
 // vectors filtered here don't need cross-axis coupling, just per-axis
 // jitter removal.
@@ -1599,8 +1071,30 @@ class Vector3OneEuroFilter {
     this.fz = new OneEuroFilter(minCutoff, beta, dCutoff)
   }
 
-  filter(v: THREE.Vector3, dt: number): THREE.Vector3 {
-    return new THREE.Vector3(this.fx.filter(v.x, dt), this.fy.filter(v.y, dt), this.fz.filter(v.z, dt))
+  // See peekSpeed — pass a shared speedOverride when this vector needs to
+  // stay in lockstep with another filter (e.g. a sibling bone) rather than
+  // each picking its own cutoff independently.
+  filter(v: THREE.Vector3, dt: number, speedOverride?: number): THREE.Vector3 {
+    return new THREE.Vector3(
+      this.fx.filter(v.x, dt, speedOverride),
+      this.fy.filter(v.y, dt, speedOverride),
+      this.fz.filter(v.z, dt, speedOverride)
+    )
+  }
+
+  // Highest of the 3 channels' own (not-yet-committed) speed estimate —
+  // used to synchronize two *different* Vector3OneEuroFilters (e.g. this
+  // arm's upper- and lower-segment direction) so they lag by the same
+  // amount at every instant instead of each adapting to its own signal's
+  // speed independently. Two segments of a genuinely straight, moving arm
+  // don't necessarily read the same *raw* speed moment to moment (their
+  // directions rotate at related but not identical rates), so without this,
+  // one segment's filter output can lag visibly behind the other's during a
+  // fast sweep — which looks exactly like the elbow briefly bending and
+  // straightening back out, even though the unfiltered tracking data never
+  // left the straight line the whole time.
+  peekSpeed(v: THREE.Vector3, dt: number): number {
+    return Math.max(this.fx.peekSpeed(v.x, dt), this.fy.peekSpeed(v.y, dt), this.fz.peekSpeed(v.z, dt))
   }
 
   // Call when the value being filtered just came back after a gap in
@@ -1827,57 +1321,67 @@ function applyPoseToVRM(vrm: VRM, resolved: ResolvedFrame, calibration: AvatarCa
     const torsoTargetForward = directionFilters.torsoForward.filter(torsoTargetForwardRaw, dt)
     aimBasisToward(vrm, calibration.torso.boneName, calibration.torso.calib, torsoTargetForward, WORLD_UP, 0.4)
 
+    // A genuinely straight, moving arm's upper/lower segments don't
+    // necessarily read the same *raw* speed moment to moment, so each
+    // filter picking its own cutoff independently can lag one segment
+    // behind the other during a fast sweep — visibly, an elbow that briefly
+    // bends and straightens back out again, even though the underlying
+    // tracked positions were on the straight line the entire time. Peeking
+    // each segment's own speed first and sharing the faster of the two
+    // (see Vector3OneEuroFilter.peekSpeed) keeps both segments' cutoffs in
+    // lockstep instead.
+    const leftUpperRawDir = new THREE.Vector3(
+      personLeftElbow.x - personLeftShoulder.x,
+      personLeftElbow.y - personLeftShoulder.y,
+      personLeftElbow.z - personLeftShoulder.z
+    )
+    const leftLowerRawDir = new THREE.Vector3(
+      personLeftWrist.x - personLeftElbow.x,
+      personLeftWrist.y - personLeftElbow.y,
+      personLeftWrist.z - personLeftElbow.z
+    )
+    const leftArmSpeed = Math.max(
+      directionFilters.leftUpper.peekSpeed(leftUpperRawDir, dt),
+      directionFilters.leftLower.peekSpeed(leftLowerRawDir, dt)
+    )
+    const rightUpperRawDir = new THREE.Vector3(
+      personRightElbow.x - personRightShoulder.x,
+      personRightElbow.y - personRightShoulder.y,
+      personRightElbow.z - personRightShoulder.z
+    )
+    const rightLowerRawDir = new THREE.Vector3(
+      personRightWrist.x - personRightElbow.x,
+      personRightWrist.y - personRightElbow.y,
+      personRightWrist.z - personRightElbow.z
+    )
+    const rightArmSpeed = Math.max(
+      directionFilters.rightUpper.peekSpeed(rightUpperRawDir, dt),
+      directionFilters.rightLower.peekSpeed(rightLowerRawDir, dt)
+    )
+
     aimBoneToward(
       vrm,
       B.RightUpperArm,
       calibration.rightArmAim.upper,
-      directionFilters.leftUpper.filter(
-        new THREE.Vector3(
-          personLeftElbow.x - personLeftShoulder.x,
-          personLeftElbow.y - personLeftShoulder.y,
-          personLeftElbow.z - personLeftShoulder.z
-        ),
-        dt
-      )
+      directionFilters.leftUpper.filter(leftUpperRawDir, dt, leftArmSpeed)
     )
     aimBoneToward(
       vrm,
       B.RightLowerArm,
       calibration.rightArmAim.lower,
-      directionFilters.leftLower.filter(
-        new THREE.Vector3(
-          personLeftWrist.x - personLeftElbow.x,
-          personLeftWrist.y - personLeftElbow.y,
-          personLeftWrist.z - personLeftElbow.z
-        ),
-        dt
-      )
+      directionFilters.leftLower.filter(leftLowerRawDir, dt, leftArmSpeed)
     )
     aimBoneToward(
       vrm,
       B.LeftUpperArm,
       calibration.leftArmAim.upper,
-      directionFilters.rightUpper.filter(
-        new THREE.Vector3(
-          personRightElbow.x - personRightShoulder.x,
-          personRightElbow.y - personRightShoulder.y,
-          personRightElbow.z - personRightShoulder.z
-        ),
-        dt
-      )
+      directionFilters.rightUpper.filter(rightUpperRawDir, dt, rightArmSpeed)
     )
     aimBoneToward(
       vrm,
       B.LeftLowerArm,
       calibration.leftArmAim.lower,
-      directionFilters.rightLower.filter(
-        new THREE.Vector3(
-          personRightWrist.x - personRightElbow.x,
-          personRightWrist.y - personRightElbow.y,
-          personRightWrist.z - personRightElbow.z
-        ),
-        dt
-      )
+      directionFilters.rightLower.filter(rightLowerRawDir, dt, rightArmSpeed)
     )
   }
 
@@ -1888,6 +1392,8 @@ function applyPoseToVRM(vrm: VRM, resolved: ResolvedFrame, calibration: AvatarCa
   applyHandToVRM(vrm, resolved.rightHand, 'Left', calibration.leftHand, dt)
 }
 
+let lastHandDebugAt = 0
+
 async function main(): Promise<void> {
   setStatus('웹캠 요청 중...')
 
@@ -1897,12 +1403,13 @@ async function main(): Promise<void> {
   const topTarget = setupAvatarRenderTarget(avatarTopCanvas, 'top')
   const sideTarget = setupAvatarRenderTarget(avatarSideCanvas, 'side')
 
-  const [, holistic, vrm] = await Promise.all([
+  const [, holistic, handLandmarker, vrm] = await Promise.all([
     startWebcamStream(),
     (async () => {
       setStatus('MediaPipe 모델 로딩 중...')
       return setupHolistic()
     })(),
+    setupHandLandmarker(),
     (async () => {
       setStatus('아바타 로딩 중...')
       return loadAvatar(scene)
@@ -1915,25 +1422,31 @@ async function main(): Promise<void> {
   const debugSkeleton = setupDebugSkeleton(scene, calibration)
   repositionDebugCameras([debugTarget, cleanTarget, topTarget, sideTarget], calibration.anchor)
 
-  // Seed the depth-reconstruction bone lengths (see PersonArmLengths) with
-  // the avatar's own bone lengths, averaged across both sides — there's no
-  // per-person measurement step, so this approximation is all resolveArm
-  // ever has to work with.
-  const avgUpperArmLength = (calibration.left.upperArm + calibration.right.upperArm) / 2
-  const avgLowerArmLength = (calibration.left.lowerArm + calibration.right.lowerArm) / 2
-  personArmLengths.left.upper = avgUpperArmLength
-  personArmLengths.left.lower = avgLowerArmLength
-  personArmLengths.right.upper = avgUpperArmLength
-  personArmLengths.right.lower = avgLowerArmLength
+  // The person's own bone lengths come from the T-pose measured by the tracking pipeline
+  // (armTracking.ts, saved in localStorage) - not from the avatar, whose proportions say nothing
+  // about the person in front of the camera. Only directions are retargeted onto the avatar.
 
   await populateCameraList()
 
   const drawer = new DrawingUtils(ctx)
   setStatus('추적 중')
-  measureButton.disabled = false
 
   let lastFrameTime = performance.now()
   const bodyOffset = new THREE.Vector3()
+
+  // requestAnimationFrame runs on the display's refresh rate, not the camera's -
+  // a source with irregular delivery (measured live: DroidCam over WiFi) let this
+  // loop re-run full inference plus four scene renders on the same stale video
+  // texture multiple times before the next real frame arrived, burning exactly
+  // the headroom needed to catch up smoothly. requestVideoFrameCallback only
+  // fires once per frame the video element actually decoded.
+  const scheduleNext = (cb: () => void): void => {
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      video.requestVideoFrameCallback(cb)
+    } else {
+      requestAnimationFrame(cb)
+    }
+  }
 
   const loop = (): void => {
     const now = performance.now()
@@ -1942,14 +1455,40 @@ async function main(): Promise<void> {
     lastFrameTime = now
 
     const result = holistic.detectForVideo(video, now)
-    drawResult(result, drawer)
+    // TEMP debug: rawCandidates has stayed 0 on every single frame across
+    // both GPU and CPU delegate, with the rest of the app running fine
+    // around it (no thrown exception reaching here) - wrapping the call
+    // itself to catch anything being swallowed, and logging video readiness
+    // once in a while in case detectForVideo is silently seeing a frame it
+    // doesn't like (e.g. a size it never gets from Holistic's own call).
+    let handResult: HandLandmarkerResult | null = null
+    try {
+      handResult = handLandmarker.detectForVideo(video, now)
+    } catch (err) {
+      console.log(`[hand] detectForVideo threw: ${(err as Error).message}`)
+    }
+    const assignedHands = handResult ? assignHandsToSides(handResult, result.poseLandmarks[0]) : { left: null, right: null }
+    if (now - lastHandDebugAt > 200) {
+      lastHandDebugAt = now
+      console.log(
+        `[hand] rawCandidates=${handResult?.landmarks.length ?? 'n/a'} assignedLeft=${assignedHands.left ? 'y' : 'n'} assignedRight=${assignedHands.right ? 'y' : 'n'} videoSize=${video.videoWidth}x${video.videoHeight} readyState=${video.readyState}`
+      )
+    }
+    drawResult(result, assignedHands, drawer)
 
     const data = trackingDataFromResult(result)
+    // Holistic's own hand branch is pose-derived and goes blind whenever the
+    // pose wrist drifts (see HAND_MODEL_URL) - overridden here with the
+    // independent HandLandmarker's assignment instead.
+    data.leftHandLandmarks = assignedHands.left?.landmarks
+    data.rightHandLandmarks = assignedHands.right?.landmarks
+    data.leftHandWorldLandmarks = assignedHands.left?.worldLandmarks
+    data.rightHandWorldLandmarks = assignedHands.right?.worldLandmarks
     // Confidence-gated hold-last-good-pose + bone-length depth reconstruction,
     // shared by the actual rigging below and the debug skeleton.
-    const resolved = resolveTrackingFrame(data)
-    updateArmCalibration(resolved)
-    updateReadout(result, fps, resolved, calibration)
+    const aspect = video.videoWidth > 0 && video.videoHeight > 0 ? video.videoWidth / video.videoHeight : 16 / 9
+    const resolved = resolveTrackingFrame(withImageXY(data, aspect), deltaSeconds)
+    updateReadout(result, assignedHands, fps, resolved, calibration)
 
     // Whole-avatar position follows the tracked shoulder line moving around
     // the frame, same as the 2D skeleton in the camera pane does.
@@ -1975,9 +1514,9 @@ async function main(): Promise<void> {
     debugSkeleton.group.visible = false
     cleanTarget.renderer.render(scene, cleanTarget.camera)
 
-    requestAnimationFrame(loop)
+    scheduleNext(loop)
   }
-  requestAnimationFrame(loop)
+  scheduleNext(loop)
 }
 
 main().catch((err) => {
